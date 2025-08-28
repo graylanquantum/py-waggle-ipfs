@@ -1,4 +1,5 @@
 
+#  Waggle IPFS: Post-Quantum AI-IPFS ColorSync Mini-Network in Python
 
 ### usage
 
@@ -45,8 +46,7 @@ docker run --rm -p 5101:5101 -p 6701:6701/udp -p 4701:4701 \
 > 
 
 
-#  Waggle IPFS: Post-Quantum Mini-Network in Python
-
+#
 ## 1. Core Goals
 
 The system attempts to:
