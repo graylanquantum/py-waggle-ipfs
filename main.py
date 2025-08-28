@@ -44,6 +44,7 @@ except Exception:
 LOG=logging.getLogger("hypertime-fullstack")
 logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"))
 ANSI=sys.stdout.isatty()
+MAX_UPLOAD=int(os.getenv("MAX_UPLOAD","67108864"))
 
 def b64e(b:bytes)->str:
     try: return base64.b64encode(b).decode()
@@ -190,27 +191,49 @@ class KVStore:
             if p.exists(): p.unlink()
 
 class ProviderIndex:
-    def __init__(self, kad:KadServer):
+    def __init__(self, kad:KadServer, ttl:int=3600):
         self.kad=kad
+        self.ttl=ttl
+    def _now(self)->int:
+        return int(time.time())
+    def _normalize(self, arr:Any)->List[Tuple[str,int]]:
+        out=[]
+        now=self._now()
+        try:
+            if isinstance(arr,list):
+                for it in arr:
+                    if isinstance(it,list) and len(it)==2 and isinstance(it[0],str) and isinstance(it[1],(int,float)):
+                        if now-int(it[1])<=self.ttl: out.append((it[0],int(it[1])))
+                    elif isinstance(it,str):
+                        out.append((it,now))
+        except Exception:
+            pass
+        return out
     async def provide(self, cid:str, addr:str):
         key=f"prov:{cid}"
         try:
             cur=await self.kad.get(key)
             if isinstance(cur,(bytes,bytearray)): cur=cur.decode()
-            arr=json.loads(cur) if cur else []
+            arr=self._normalize(json.loads(cur) if cur else [])
         except Exception:
             arr=[]
-        if addr not in arr: arr.append(addr)
+        now=self._now()
+        arr=[(a,t) for a,t in arr if now-t<=self.ttl and a!=addr]
+        arr.append((addr,now))
         await self.kad.set(key, json.dumps(arr))
     async def find(self, cid:str)->List[str]:
         key=f"prov:{cid}"
         try:
             v=await self.kad.get(key)
             if isinstance(v,(bytes,bytearray)): v=v.decode()
-            arr=json.loads(v) if v else []
-            return [str(x) for x in arr]
+            arr=self._normalize(json.loads(v) if v else [])
         except Exception:
-            return []
+            arr=[]
+        now=self._now()
+        arr=[(a,t) for a,t in arr if now-t<=self.ttl]
+        try: await self.kad.set(key, json.dumps(arr))
+        except Exception: pass
+        return [a for a,_ in arr]
     async def waggle_set(self, round_id:int, addr:str):
         key=f"waggle:{round_id}"
         try:
@@ -255,17 +278,27 @@ class PQSession:
         k=oqs.KeyEncapsulation(self.kem_alg); k.import_secret_key(self.kem_sk); return k.decap_secret(ct)
 
 class AeadStream:
+    MAX_FRAME=1<<20
     def __init__(self, reader:asyncio.StreamReader, writer:asyncio.StreamWriter, key:bytes):
-        self.r=reader; self.w=writer; self.key=key; self.aes=AESGCM(key)
-    async def send(self, payload:bytes):
-        n=os.urandom(12); ct=self.aes.encrypt(n, payload, None)
-        l=len(n)+len(ct); self.w.write(struct.pack("!I", l)+n+ct); await self.w.drain()
-    async def recv(self)->bytes:
+        self.r=reader; self.w=writer; self.aes=AESGCM(key); self.tx_ctr=0
+    def _nonce(self, ctr:int)->bytes:
+        return ctr.to_bytes(12,"big")
+    async def send(self, sid:int, payload:bytes):
+        self.tx_ctr+=1
+        n=self._nonce(self.tx_ctr)
+        aad=struct.pack("!IQ", sid, self.tx_ctr)
+        ct=self.aes.encrypt(n, payload, aad)
+        frame=struct.pack("!I", len(n)+len(aad)+len(ct))+n+aad+ct
+        self.w.write(frame); await self.w.drain()
+    async def recv(self)->Tuple[int,bytes]:
         hdr=await self.r.readexactly(4)
         l=struct.unpack("!I", hdr)[0]
+        if l>self.MAX_FRAME: raise ValueError("frame too large")
         chunk=await self.r.readexactly(l)
-        n=chunk[:12]; ct=chunk[12:]
-        return self.aes.decrypt(n, ct, None)
+        n=chunk[:12]; aad=chunk[12:24]; ct=chunk[24:]
+        sid,ctr=struct.unpack("!IQ", aad)
+        pt=self.aes.decrypt(n, ct, aad)
+        return sid, pt
     def close(self):
         try: self.w.close()
         except Exception: pass
@@ -277,18 +310,20 @@ class MiniMux:
         async def reader():
             while not self._closed:
                 try:
-                    data=await self.aead.recv()
-                    if len(data)<5: continue
-                    sid=struct.unpack("!I", data[:4])[0]
-                    self.inbox.setdefault(sid, asyncio.Queue()).put_nowait(data[4:])
+                    sid,data=await self.aead.recv()
+                    self.inbox.setdefault(sid, asyncio.Queue()).put_nowait(data)
                 except Exception:
                     break
         self.reader_task=asyncio.create_task(reader())
     async def open_stream(self)->Tuple[int,Callable[[bytes],Awaitable[None]],Callable[[],Awaitable[bytes]]]:
         self.sid+=1; sid=self.sid
-        async def send(b:bytes): await self.aead.send(struct.pack("!I", sid)+b)
+        async def send(b:bytes): await self.aead.send(sid, b)
         async def recv()->bytes: return await self.inbox.setdefault(sid, asyncio.Queue()).get()
         return sid, send, recv
+    async def send(self, sid:int, b:bytes):
+        await self.aead.send(sid,b)
+    async def recv(self, sid:int)->bytes:
+        return await self.inbox.setdefault(sid, asyncio.Queue()).get()
     async def close(self):
         self._closed=True
         try: self.aead.close()
@@ -296,6 +331,16 @@ class MiniMux:
         try:
             if self.reader_task: self.reader_task.cancel()
         except Exception: pass
+
+class MuxedConn:
+    def __init__(self, mux:MiniMux, sid:int):
+        self.mux=mux; self.sid=sid
+    async def send(self, b:bytes):
+        await self.mux.send(self.sid, b)
+    async def recv(self)->bytes:
+        return await self.mux.recv(self.sid)
+    async def close(self):
+        await self.mux.close()
 
 class Lp2pUnavailable(Exception): pass
 
@@ -333,17 +378,19 @@ class Libp2pWrapper:
 
 class FallbackTransport:
     def __init__(self, listen_addr:str):
-        self.listen_addr=listen_addr; self.server=None; self.handlers:Dict[str,Callable[[AeadStream],Awaitable[None]]]={}; self._kem_alg="ML-KEM-768"
-    def register(self, proto:str, handler:Callable[[AeadStream],Awaitable[None]]): self.handlers[proto]=handler
+        self.listen_addr=listen_addr; self.server=None; self.handlers:Dict[str,Callable[[Callable[[bytes],Awaitable[None]],Callable[[],Awaitable[bytes]],MiniMux],Awaitable[None]]]={}; self._kem_alg="ML-KEM-768"
+    def register(self, proto:str, handler:Callable[[Callable[[bytes],Awaitable[None]],Callable[[],Awaitable[bytes]],MiniMux],Awaitable[None]]): self.handlers[proto]=handler
     async def start(self):
         host,port=self.listen_addr.split(":"); port=int(port)
         async def handle(reader, writer):
+            mux=None
             try:
                 my=PQSession(self._kem_alg,"Dilithium3")
                 writer.write(struct.pack("!I", len(my.kem_pk))+my.kem_pk); await writer.drain()
                 peer_pk_len=struct.unpack("!I", await reader.readexactly(4))[0]
                 peer_pk=await reader.readexactly(peer_pk_len)
-                if hash(writer.get_extra_info("peername"))%2==0:
+                initiator = my.kem_pk < peer_pk
+                if initiator:
                     ct,ss=my.encap_to(peer_pk)
                     writer.write(struct.pack("!I", len(ct))+ct); await writer.drain()
                     peer_ct_len=struct.unpack("!I", await reader.readexactly(4))[0]
@@ -355,7 +402,7 @@ class FallbackTransport:
                     ss2=my.decap(peer_ct)
                     ct,ss=my.encap_to(peer_pk)
                     writer.write(struct.pack("!I", len(ct))+ct); await writer.drain()
-                key=hkdf(ss+ss2, b"mini-fb", b"transport/1", 32)
+                key=hkdf(ss+ss2, b"mini-fb", f"transport/1|{self._kem_alg}|AESGCM".encode(), 32)
                 st=AeadStream(reader, writer, key)
                 mux=MiniMux(st); await mux.start()
                 sid, send, recv = await mux.open_stream()
@@ -364,23 +411,27 @@ class FallbackTransport:
                 proto=first[6:].decode().strip()
                 h=self.handlers.get(proto)
                 if not h: return
-                await h(st)
+                await h(send, recv, mux)
             except Exception:
                 pass
             finally:
+                try:
+                    if mux: await mux.close()
+                except Exception: pass
                 try: writer.close()
                 except Exception: pass
         self.server=await asyncio.start_server(handle, host, port)
     async def stop(self):
         if self.server: self.server.close(); await self.server.wait_closed()
-    async def dial(self, addr:str, proto:str)->AeadStream:
+    async def dial(self, addr:str, proto:str)->MuxedConn:
         host,port=addr.split(":"); port=int(port)
         r,w=await asyncio.open_connection(host,port)
         my=PQSession(self._kem_alg,"Dilithium3")
         w.write(struct.pack("!I", len(my.kem_pk))+my.kem_pk); await w.drain()
         srv_pk_len=struct.unpack("!I", await r.readexactly(4))[0]
         srv_pk=await r.readexactly(srv_pk_len)
-        if hash((host,port))%2==0:
+        initiator = my.kem_pk < srv_pk
+        if initiator:
             ct,ss=my.encap_to(srv_pk)
             w.write(struct.pack("!I", len(ct))+ct); await w.drain()
             peer_ct_len=struct.unpack("!I", await r.readexactly(4))[0]
@@ -392,12 +443,12 @@ class FallbackTransport:
             ss2=my.decap(peer_ct)
             ct,ss=my.encap_to(srv_pk)
             w.write(struct.pack("!I", len(ct))+ct); await w.drain()
-        key=hkdf(ss+ss2, b"mini-fb", b"transport/1", 32)
+        key=hkdf(ss+ss2, b"mini-fb", f"transport/1|{self._kem_alg}|AESGCM".encode(), 32)
         st=AeadStream(r,w,key)
         mux=MiniMux(st); await mux.start()
         sid, send, recv = await mux.open_stream()
         await send(b"PROTO "+proto.encode())
-        return st
+        return MuxedConn(mux, sid)
 
 EX_PROTO="/miniipfs/blocks/1.0.0"
 WAG_PROTO="/waggle/colors/2.0.0"
@@ -415,7 +466,7 @@ class LLMColors:
             except Exception:
                 self.ok=False
     def prompt(self, rnd:str, node:str, topic:str)->str:
-        return "You are ColorSyncer. Output exactly 8 color tokens separated by spaces. Each token is a CSS color name or #RRGGBB. No extra words.\nRound:"+rnd+" Node:"+node+" Topic:"+topic+"\nPalette:"
+        return ("You are ColorSyncer, a palette synthesizer. Output exactly 8 CSS color tokens separated by single spaces; each token must be either a W3C CSS color name or a hex color in the form #RRGGBB. Do not include any extra text, punctuation, numbering, or explanations. Avoid near-duplicates, cover diverse hues across the wheel, include at least one dark anchor and one light accent, avoid extremely low-contrast combinations, and bias toward harmonious yet distinctive sets suitable for identity beacons. Prefer web-safe names if names are chosen; otherwise use hex. Hard constraints: 8 tokens, space-delimited, no commas, no line breaks, no quotes, no commentary. Round="+rnd+" Node="+node+" Topic="+topic+" Palette:")
     def generate(self, seed_text:str, rnd:str, node:str, topic:str)->List[Tuple[int,int,int]]:
         if self.ok:
             res=self.llm(self.prompt(rnd,node,topic), max_tokens=64, temperature=0.7, top_p=0.9, seed=det_seed(seed_text,rnd,node,topic)) or {}
@@ -460,11 +511,14 @@ class RateLimiter:
 
 class GossipBus:
     def __init__(self, transport:Union[Libp2pWrapper,FallbackTransport], proto:str, peer_id:str, fanout:int=6, ttl:float=15.0):
-        self.transport=transport; self.proto=proto; self.peer_id=peer_id; self.fanout=fanout; self.ttl=ttl; self.seen:Dict[str,float]={}; self.rate=RateLimiter(32,1.0)
+        self.transport=transport; self.proto=proto; self.peer_id=peer_id; self.fanout=fanout; self.ttl=ttl; self.seen:Dict[str,float]={}; self.rate=RateLimiter(32,1.0); self.fallback_peers=set()
         if isinstance(transport, Libp2pWrapper): transport.set_handler(proto, self._lp2p_handler)
         else: transport.register(proto, self._fb_handler)
+    def register_peer(self, addr:str):
+        if addr and ":" in addr and not addr.startswith("/"): self.fallback_peers.add(addr)
     def _msg_id(self, msg:Dict[str,Any])->str:
-        return h32(canonical({k:v for k,v in msg.items() if k!='sig'}))+ (msg.get("sig","")[:8] if isinstance(msg.get("sig"),str) else "")
+        b={k:v for k,v in msg.items() if k!='digest'}
+        return h32(canonical(b))+(msg.get("digest","")[:8] if isinstance(msg.get("digest"),str) else "")
     async def _lp2p_handler(self, host, stream):
         try:
             hdr=await stream.read(4)
@@ -482,10 +536,8 @@ class GossipBus:
         finally:
             try: await stream.close()
             except Exception: pass
-    async def _fb_handler(self, aead:AeadStream):
+    async def _fb_handler(self, send, recv, mux):
         try:
-            mux=MiniMux(aead); await mux.start()
-            sid, send, recv = await mux.open_stream()
             data=await recv()
             obj=canonical_load(data)
             if not isinstance(obj,dict): return
@@ -501,21 +553,32 @@ class GossipBus:
             peers=[]
             if isinstance(self.transport, Libp2pWrapper) and getattr(self.transport,"host",None):
                 peers=[p for p in self.transport.host.get_peerstore().peers() if str(p)!=src_addr]
-            random.shuffle(peers); peers=peers[:self.fanout]
-            payload=canonical(msg)
-            for p in peers:
-                try:
-                    st=await self.transport.host.new_stream(p,[self.proto])
-                    await st.write(struct.pack("!I", len(payload))+payload); await st.drain()
-                    try: await st.close()
-                    except Exception: pass
-                except Exception:
-                    continue
+                random.shuffle(peers); peers=peers[:self.fanout]
+                payload=canonical(msg)
+                for p in peers:
+                    try:
+                        st=await self.transport.host.new_stream(p,[self.proto])
+                        await st.write(struct.pack("!I", len(payload))+payload); await st.drain()
+                        try: await st.close()
+                        except Exception: pass
+                    except Exception:
+                        continue
+            else:
+                peers=[a for a in list(self.fallback_peers) if a!=src_addr]
+                random.shuffle(peers); peers=peers[:self.fanout]
+                payload=canonical(msg)
+                for addr in peers:
+                    try:
+                        conn=await self.transport.dial(addr, self.proto)
+                        await conn.send(payload)
+                        await conn.close()
+                    except Exception:
+                        continue
         except Exception:
             pass
     async def publish(self, obj:Dict[str,Any]):
         try:
-            obj["src"]=self.peer_id; obj["ts"]=now_ms(); obj["sig"]=b64e(sha256(canonical(obj)))
+            obj["src"]=self.peer_id; obj["ts"]=now_ms(); obj["digest"]=b64e(sha256(canonical(obj)))
             await self.forward(self.peer_id, obj)
         except Exception:
             pass
@@ -562,10 +625,8 @@ class ExchangeServer:
         finally:
             try: await stream.close()
             except Exception: pass
-    async def _fb_handler(self, aead:AeadStream):
+    async def _fb_handler(self, send, recv, mux):
         try:
-            mux=MiniMux(aead); await mux.start()
-            sid, send, recv = await mux.open_stream()
             hello=await recv()
             if not hello.startswith(b"ADDR "): return
             peer_addr=hello[5:].decode().strip()
@@ -611,15 +672,17 @@ class ExchangeClient:
                     try: await st.close()
                     except Exception: pass
             else:
-                st=await self.t.dial(peer_addr, EX_PROTO)
-                mux=MiniMux(st); await mux.start()
-                sid, send, recv = await mux.open_stream()
-                await send(b"ADDR "+self.my_addr.encode())
-                if await recv()!=b"OK": return None
-                await send(b"WANT "+cid.encode())
-                rsp=await recv()
-                if rsp.startswith(b"BLOCK "): return rsp.split(b" ",2)[2]
-                st.close()
+                conn=await self.t.dial(peer_addr, EX_PROTO)
+                await conn.send(b"ADDR "+self.my_addr.encode())
+                if await conn.recv()!=b"OK":
+                    await conn.close(); return None
+                await conn.send(b"WANT "+cid.encode())
+                rsp=await conn.recv()
+                if rsp.startswith(b"BLOCK "):
+                    data=rsp.split(b" ",2)[2]
+                    await conn.close()
+                    return data
+                await conn.close()
         except Exception:
             return None
         return None
@@ -686,10 +749,19 @@ class MiniIPFSNode:
             if req.can_read_body and req.content_type and req.content_type.startswith("multipart/"):
                 post=await req.post(); f=post.get("file")
                 if f is None: return aiohttp.web.json_response({"Message":"file missing"}, status=400)
-                data=f.file.read()
+                size=None
+                try:
+                    if hasattr(f.file,"seek") and hasattr(f.file,"tell"):
+                        f.file.seek(0,os.SEEK_END); size=f.file.tell(); f.file.seek(0)
+                except Exception:
+                    pass
+                if size is not None and size>MAX_UPLOAD: return aiohttp.web.json_response({"Message":"too large"}, status=413)
+                data=f.file.read(MAX_UPLOAD+1)
+                if len(data)>MAX_UPLOAD: return aiohttp.web.json_response({"Message":"too large"}, status=413)
             else:
-                data=await req.read()
+                data=await req.content.read(MAX_UPLOAD+1)
                 if not data: return aiohttp.web.json_response({"Message":"empty"}, status=400)
+                if len(data)>MAX_UPLOAD: return aiohttp.web.json_response({"Message":"too large"}, status=413)
             block=dagcbor_encode({"bytes":data})
             cid=await self.store.put(block)
             addr=self.listen if self.lp2p_ok else f"{self.dht[0]}:{self.dht[1]+2001}"
@@ -704,12 +776,12 @@ class MiniIPFSNode:
             raw=await self.store.get(cid)
             try: obj=dagcbor_decode(raw); data=obj.get("bytes", b"")
             except Exception: data=raw
-            return aiohttp.web.Response(body=data)
+            return aiohttp.web.Response(body=data, content_type="application/octet-stream")
         provs=await self.providers.find(cid)
         for addr in provs:
             try:
                 data=await asyncio.wait_for(self.client.get(addr, cid), timeout=8.0)
-                if data is not None: return aiohttp.web.Response(body=data)
+                if data is not None: return aiohttp.web.Response(body=data, content_type="application/octet-stream")
             except Exception:
                 await asyncio.sleep(jitter(0.2))
         return aiohttp.web.Response(status=404, text="not found")
@@ -778,7 +850,7 @@ class WaggleService:
     def _palette(self, rnd:int)->List[Tuple[int,int,int]]:
         seed=f"{self.topic}|{rnd}|{self.identity_addr}"; return self.llm.generate(seed, str(rnd), self.identity_addr, self.topic)
     def _derive(self, ss:bytes, a:str, b:str, rnd:int)->bytes:
-        salt=sha256(f"{self.topic}|{rnd}".encode()); info=("WAGGLE-"+("|".join(sorted([a,b])))).encode(); return hkdf(ss, salt, info, 32)
+        salt=sha256(f"{self.topic}|{rnd}".encode()); info=("WAGGLE/2|"+self.kem_alg+"|"+self.sig_alg+"|"+("|".join(sorted([a,b])))).encode(); return hkdf(ss, salt, info, 32)
     def _hello_obj(self, rnd:int, seq:List[Tuple[int,int,int]])->Dict[str,Any]:
         obj={"t":"hello","topic":self.topic,"round":rnd,"addr":self.identity_addr,"kem_alg":self.kem_alg,"sig_alg":self.sig_alg,"kem_pk":b64e(self.pq.kem_pk),"sig_pk":b64e(self.pq.sig_pk),"seq":seq_to_hex(seq),"ctr":random.randint(1,1<<30),"ts":now_ms(),"nonce":b64e(os.urandom(8))}
         obj["sig"]=self.pq.sign(obj); return obj
@@ -807,21 +879,24 @@ class WaggleService:
             sim=palette_similarity(my_seq,their_seq)
             if sim<self.threshold:
                 await wblob(canonical({"t":"reject","sim":sim})); return
-            await self.gossip.publish({"topic":self.topic,"round":rnd,"seq_hash":h32(canonical({"mine":seq_to_hex(my_seq),"theirs":obj.get("seq",[])})),"sim":round(sim,4),"ctr":obj.get("ctr",0)})
             ct, ss = self.pq.encap_to(b64d(obj["kem_pk"]))
             key=self._derive(ss, self.identity_addr, their_addr, rnd)
             self.sessions[(their_addr,rnd)]=key
             ack={"t":"ack","topic":self.topic,"round":rnd,"from":self.identity_addr,"kem_ct":b64e(ct),"seq":seq_to_hex(my_seq),"ts":now_ms()}
             await wblob(canonical(ack))
+            try:
+                exp=int(time.time())+self.round_seconds
+                await self.allow.allow(their_addr, exp)
+                self.gossip.register_peer(their_addr)
+            except Exception:
+                pass
         except Exception:
             pass
         finally:
             try: await stream.close()
             except Exception: pass
-    async def _fb_handler(self, aead:AeadStream):
+    async def _fb_handler(self, send, recv, mux):
         try:
-            mux=MiniMux(aead); await mux.start()
-            sid, send, recv = await mux.open_stream()
             raw=await recv()
             obj=canonical_load(raw)
             if not isinstance(obj,dict): return
@@ -838,12 +913,17 @@ class WaggleService:
             sim=palette_similarity(my_seq,their_seq)
             if sim<self.threshold:
                 await send(canonical({"t":"reject","sim":sim})); return
-            await self.gossip.publish({"topic":self.topic,"round":rnd,"seq_hash":h32(canonical({"mine":seq_to_hex(my_seq),"theirs":obj.get("seq",[])})),"sim":round(sim,4),"ctr":obj.get("ctr",0)})
             ct, ss = self.pq.encap_to(b64d(obj["kem_pk"]))
             key=self._derive(ss, self.identity_addr, their_addr, rnd)
             self.sessions[(their_addr,rnd)]=key
             ack={"t":"ack","topic":self.topic,"round":rnd,"from":self.identity_addr,"kem_ct":b64e(ct),"seq":seq_to_hex(my_seq),"ts":now_ms()}
             await send(canonical(ack))
+            try:
+                exp=int(time.time())+self.round_seconds
+                await self.allow.allow(their_addr, exp)
+                self.gossip.register_peer(their_addr)
+            except Exception:
+                pass
         except Exception:
             pass
     async def round_loop(self):
@@ -884,6 +964,7 @@ class WaggleService:
                     self.sessions[(peer_addr,rnd)]=key
                     exp=int(time.time())+self.round_seconds
                     await self.allow.allow(peer_addr, exp)
+                    self.gossip.register_peer(peer_addr)
                     sim=palette_similarity(seq,[(int(h[1:3],16),int(h[3:5],16),int(h[5:7],16)) for h in resp.get("seq",[])])
                     self.verdicts.put(peer_addr, rnd, sim)
                     print(json.dumps({"peer":peer_addr,"round":rnd,"verdict":"[replytemplate]SECURE[/replytemplate]","sim":round(sim,4),"seq_peer":resp.get("seq",[])}))
@@ -892,19 +973,19 @@ class WaggleService:
                     try: await st.close()
                     except Exception: pass
             else:
-                fb=self.identity_addr.replace("/ip4/","").replace("/tcp/","").replace("/","")
-                st=await self.transport.dial(fb, WAG_PROTO)
-                mux=MiniMux(st); await mux.start()
-                sid, send, recv = await mux.open_stream()
-                await send(canonical(hello))
-                rsp=await recv()
+                conn=await self.transport.dial(peer_addr, WAG_PROTO)
+                await conn.send(canonical(hello))
+                rsp=await conn.recv()
                 obj=canonical_load(rsp)
-                if not isinstance(obj,dict) or obj.get("t")!="ack": return
+                if not isinstance(obj,dict) or obj.get("t")!="ack":
+                    await conn.close(); return
                 ss=self.pq.decap(b64d(obj["kem_ct"]))
                 key=self._derive(ss, self.identity_addr, obj.get("from",""), rnd)
                 self.sessions[(peer_addr,rnd)]=key
                 exp=int(time.time())+self.round_seconds
                 await self.allow.allow(peer_addr, exp)
+                self.gossip.register_peer(peer_addr)
+                await conn.close()
         except Exception:
             pass
         finally:
@@ -940,10 +1021,8 @@ class ControlService:
         finally:
             try: await stream.close()
             except Exception: pass
-    async def _fb_handler(self, aead:AeadStream):
+    async def _fb_handler(self, send, recv, mux):
         try:
-            mux=MiniMux(aead); await mux.start()
-            sid, send, recv = await mux.open_stream()
             data=await recv()
             cmd=(data or b"").decode().strip()
             if cmd=="stats":
