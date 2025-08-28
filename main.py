@@ -41,6 +41,13 @@ try:
 except Exception:
     webcolors=None
 
+try:
+    import pennylane as qml
+    HAVE_QML=True
+except Exception:
+    qml=None
+    HAVE_QML=False
+
 LOG=logging.getLogger("hypertime-fullstack")
 logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"))
 ANSI=sys.stdout.isatty()
@@ -158,6 +165,167 @@ def show_palette(title:str, seq:List[Tuple[int,int,int]]):
     for c in seq: sys.stdout.write(rgb_block(c))
     print(); sys.stdout.flush()
 
+def sys_metrics(entropy:float=0.0)->Tuple[float,float,float,float,float,float,float]:
+    # non-blocking CPU snapshot
+    cpu = psutil.cpu_percent(interval=None)/100.0
+    mem = psutil.virtual_memory().percent/100.0
+    try:
+        la = os.getloadavg()[0] / max(1, psutil.cpu_count())
+        load = max(0.0, min(1.0, la))
+    except Exception:
+        load = cpu
+    try:
+        io = psutil.disk_io_counters()
+        iops = (io.read_count + io.write_count) / 1e5
+        diskio = math.tanh(iops)
+    except Exception:
+        diskio = 0.5
+    try:
+        n = psutil.net_io_counters()
+        net = math.tanh((n.bytes_sent + n.bytes_recv) / 5e8)
+    except Exception:
+        net = 0.5
+    try:
+        temps = psutil.sensors_temperatures()
+        flat = [t.current for arr in temps.values() for t in arr if getattr(t,"current",None)]
+        temp = max(0.0, min(1.0, (sum(flat)/len(flat)-30)/50)) if flat else 0.5
+    except Exception:
+        temp = 0.5
+    ent = max(0.0, min(1.0, (entropy%1.0)))
+    return (cpu, mem, net, diskio, load, temp, ent)
+
+if HAVE_QML:
+    DEV = qml.device("default.qubit", wires=7)
+    def hyperrgb7(params:Tuple[float,...], wires:List[int]):
+        a,b,c,d,e,f,g = params
+        qml.AngleEmbedding([a,b,c,d,e,f,g], wires=wires, rotation="Y")
+        qml.AngleEmbedding([g,f,e,d,c,b,a], wires=wires, rotation="Z")
+        for i in range(7):
+            qml.CNOT(wires=[wires[i], wires[(i+1)%7]])
+        qml.CRX(math.pi*(0.25+a), wires=[wires[0], wires[3]])
+        qml.CRY(math.pi*(0.25+b), wires=[wires[1], wires[4]])
+        qml.CRZ(math.pi*(0.25+c), wires=[wires[2], wires[5]])
+        qml.MultiRZ(math.pi*(0.2+d+e), wires=[wires[0],wires[1],wires[2]])
+        qml.MultiRZ(math.pi*(0.2+f+g), wires=[wires[3],wires[4],wires[5]])
+        qml.ctrl(qml.RZ, control=wires[6])(2*math.pi*(0.1+g), wires=wires[0])
+        qml.ctrl(qml.RY, control=wires[0])(2*math.pi*(0.1+a), wires=wires[6])
+        for i in range(7):
+            qml.Rot(2*math.pi*(0.1+a*b), 2*math.pi*(0.1+c*d), 2*math.pi*(0.1+e*f), wires=wires[i])
+    @qml.qnode(DEV, interface=None)
+    def rgb_qnode(params:Tuple[float,...], seed_phase:float=0.0):
+        wires=list(range(7))
+        hyperrgb7(params, wires)
+        qml.RZ(2*math.pi*seed_phase, wires=wires[6])
+        return qml.expval(qml.PauliZ(wires=0)), qml.expval(qml.PauliZ(wires=3)), qml.expval(qml.PauliZ(wires=5)), qml.expval(qml.PauliZ(wires=6))
+else:
+    def rgb_qnode(params:Tuple[float,...], seed_phase:float=0.0):
+        rnd=int.from_bytes(sha256("|".join([str(x) for x in params]+[str(seed_phase)]).encode())[:6],"big")%1000
+        return (math.tanh((rnd%29)/10.0), math.tanh((rnd%37)/10.0), math.tanh((rnd%41)/10.0), 0.0)
+
+def exp_to_rgb(vals:Tuple[float,float,float], gamma:float=2.2)->Tuple[int,int,int]:
+    def t(x):
+        v=(x+1.0)/2.0
+        v=max(0.0,min(1.0,v))
+        return int((v**(1/gamma))*255+0.5)
+    return (t(vals[0]), t(vals[1]), t(vals[2]))
+
+def normalize_fb(addr:str)->str:
+    if isinstance(addr,str) and addr.startswith("/ip4/") and "/tcp/" in addr:
+        try:
+            parts=addr.strip("/").split("/")
+            ip=parts[1]; port=parts[3]
+            return f"{ip}:{int(port)}"
+        except Exception:
+            return addr
+    return addr
+
+class HypertimeLLM:
+    def __init__(self, model_path:str=None, n_ctx:int=2048, n_gpu_layers:int=-1):
+        self.ok=False
+        self.model_path=model_path or os.getenv("LLAMA_MODEL","/data/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf")
+        if HAS_LLAMA:
+            try:
+                self.llm=Llama(model_path=self.model_path, n_ctx=n_ctx, n_gpu_layers=n_gpu_layers)
+                self.ok=True
+            except Exception:
+                self.ok=False
+        self.lock=threading.Lock()
+    def _extract(self, text:str)->str:
+        if not isinstance(text,str): return ""
+        lo=text.lower()
+        a=lo.find("[replytemplate]")
+        b=lo.find("[/replytemplate]")
+        if a!=-1 and b!=-1 and b>a:
+            return text[a+15:b].strip()
+        return text.strip()
+    def _mk_prompt(self, rnd:str, node:str, topic:str, metrics:Tuple[float,...], anchors:List[str], qstate:Dict[str,Any])->str:
+        cpu,mem,net,diskio,load,temp,ent=metrics
+        ctx=json.dumps({"round":rnd,"node":node,"topic":topic,"cpu":round(cpu,3),"mem":round(mem,3),"net":round(net,3),"io":round(diskio,3),"load":round(load,3),"temp":round(temp,3),"entropy":round(ent,3),"anchors":anchors}, separators=(",",":"))
+        qst=json.dumps(qstate, separators=(",",":"))
+        return (
+            "[action]\n"
+            "role=palette_controller\n"
+            "objective=produce 8-color identity palette for color-sync beacons\n"
+            "constraints:\n"
+            "- output exactly 8 tokens\n"
+            "- tokens are CSS color names or #RRGGBB hex\n"
+            "- tokens separated by single spaces\n"
+            "- no punctuation, commas, quotes, counts, or extra words\n"
+            "- include at least one near-black anchor and one light accent\n"
+            "- maximize hue coverage while maintaining contrast pairs\n"
+            "- avoid near-duplicates and ultra-low-contrast combos\n"
+            "- prefer common W3C names when reasonable; else hex\n"
+            "context="+ctx+"\n"
+            "strategy:\n"
+            "- seed from anchors, then span hues with ~45° steps\n"
+            "- ensure warm/cool balance and a mid-contrast neutral\n"
+            "- adjust novelty by entropy; keep outputs deterministic for seed\n"
+            "[/action]\n"
+            "[quantum_state]\n"
+            + qst + "\n"
+            "[/quantum_state]\n"
+            "[replytemplate]\n"
+            "\n"
+            "[/replytemplate]\n"
+        )
+    def generate(self, seed_text:str, rnd:str, node:str, topic:str, entropy:float=0.0)->List[Tuple[int,int,int]]:
+        metrics=sys_metrics(entropy)
+        params=tuple(float(x) for x in metrics[:7])
+        seed_phase=((det_seed(seed_text,rnd,node,topic)&0xFFFF)/65535.0)
+        rx,ry,rz,phi=rgb_qnode(params, seed_phase)
+        r,g,b=exp_to_rgb((rx,ry,rz))
+        anchors=[f"#{r:02x}{g:02x}{b:02x}","#0a0a0a","#f5f5f5"]
+        qstate={"exp":{"r":rx,"g":ry,"b":rz,"phi":phi},"seed_phase":seed_phase}
+        prompt=self._mk_prompt(rnd,node,topic,metrics,anchors,qstate)
+        if self.ok:
+            with self.lock:
+                try:
+                    res=self.llm(prompt, max_tokens=64, temperature=min(1.0,0.55+0.35*metrics[-1]), top_p=0.9, seed=det_seed(seed_text,rnd,node,topic)) or {}
+                    out=(res.get("choices") or [{}])[0].get("text","")
+                except Exception:
+                    out=""
+        else:
+            random.seed(det_seed(seed_text,rnd,node,topic))
+            toks=[anchors[0],anchors[1]]
+            for _ in range(6):
+                h=random.random()
+                s=0.55+0.35*random.random()
+                v=0.65+0.30*random.random()
+                rr,gg,bb=colorsys.hsv_to_rgb(h,s,v)
+                toks.append(f"#{int(rr*255):02x}{int(gg*255):02x}{int(bb*255):02x}")
+            out=" ".join(toks)
+        core=self._extract(out)
+        seq=parse_colors(core, 8)
+        if len(seq)<8:
+            random.seed(det_seed(seed_text,rnd,node,topic))
+            while len(seq)<8:
+                h=random.random()
+                s=0.55+0.35*random.random()
+                v=0.65+0.30*random.random()
+                rr,gg,bb=colorsys.hsv_to_rgb(h,s,v)
+                seq.append((int(rr*255),int(gg*255),int(bb*255)))
+        return seq
+
 class BlockStore:
     def __init__(self, root:str):
         self.root=pathlib.Path(root); self.root.mkdir(parents=True, exist_ok=True)
@@ -175,17 +343,22 @@ class BlockStore:
 class KVStore:
     def __init__(self, root:str):
         self.root=pathlib.Path(root); self.root.mkdir(parents=True, exist_ok=True); self.lock=asyncio.Lock()
-    def _p(self,k:str)->pathlib.Path: return self.root/h32(k.encode())
-    async def get(self, k:str)->Optional[bytes]:
+    def _key_bytes(self, k:Union[str,bytes])->bytes:
+        if isinstance(k, bytes): return k
+        if isinstance(k, str): return k.encode()
+        return str(k).encode()
+    def _p(self,k:Union[str,bytes])->pathlib.Path:
+        return self.root / h32(self._key_bytes(k))
+    async def get(self, k:Union[str,bytes])->Optional[bytes]:
         async with self.lock:
             p=self._p(k)
             if not p.exists(): return None
             return p.read_bytes()
-    async def set(self, k:str, v:bytes):
+    async def set(self, k:Union[str,bytes], v:bytes):
         async with self.lock:
             p=self._p(k); tmp=self.root/(".tmp."+secrets.token_hex(8))
             tmp.write_bytes(v); os.replace(tmp,p)
-    async def delete(self, k:str):
+    async def delete(self, k:Union[str,bytes]):
         async with self.lock:
             p=self._p(k)
             if p.exists(): p.unlink()
@@ -275,16 +448,21 @@ class PQSession:
         with oqs.KeyEncapsulation(self.kem_alg) as k:
             ct, ss = k.encap_secret(peer_pk); return ct, ss
     def decap(self, ct:bytes)->bytes:
-        k=oqs.KeyEncapsulation(self.kem_alg); k.import_secret_key(self.kem_sk); return k.decap_secret(ct)
+        with oqs.KeyEncapsulation(self.kem_alg) as k:
+            k.import_secret_key(self.kem_sk); return k.decap_secret(ct)
 
 class AeadStream:
     MAX_FRAME=1<<20
     def __init__(self, reader:asyncio.StreamReader, writer:asyncio.StreamWriter, key:bytes):
         self.r=reader; self.w=writer; self.aes=AESGCM(key); self.tx_ctr=0
+        self.rx_ctr: Dict[int,int] = {}  # per-stream last seen ctr
     def _nonce(self, ctr:int)->bytes:
         return ctr.to_bytes(12,"big")
     async def send(self, sid:int, payload:bytes):
         self.tx_ctr+=1
+        # guard against nonce space exhaustion (12-byte nonce, but keep sane bound)
+        if self.tx_ctr >= (1<<32):  # conservative bound
+            raise OverflowError("nonce/ctr space exhausted")
         n=self._nonce(self.tx_ctr)
         aad=struct.pack("!IQ", sid, self.tx_ctr)
         ct=self.aes.encrypt(n, payload, aad)
@@ -297,7 +475,11 @@ class AeadStream:
         chunk=await self.r.readexactly(l)
         n=chunk[:12]; aad=chunk[12:24]; ct=chunk[24:]
         sid,ctr=struct.unpack("!IQ", aad)
+        last=self.rx_ctr.get(sid, 0)
+        if ctr <= last:
+            raise ValueError("replay/old frame")
         pt=self.aes.decrypt(n, ct, aad)
+        self.rx_ctr[sid]=ctr
         return sid, pt
     def close(self):
         try: self.w.close()
@@ -455,72 +637,25 @@ WAG_PROTO="/waggle/colors/2.0.0"
 SYNC_PROTO="/sync/broadcast/1.0.0"
 CTRL_PROTO="/ctrl/admin/1.0.0"
 
-class LLMColors:
-    def __init__(self, model_path=None, ctx=2048, n_gpu_layers=-1):
-        self.model_path=model_path or os.getenv("LLAMA_MODEL","/data/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf")
-        self.ctx=ctx; self.n_gpu_layers=n_gpu_layers; self.ok=False
-        if HAS_LLAMA:
-            try:
-                self.llm=Llama(model_path=self.model_path, n_ctx=self.ctx, n_gpu_layers=self.n_gpu_layers)
-                self.ok=True
-            except Exception:
-                self.ok=False
-    def prompt(self, rnd:str, node:str, topic:str)->str:
-        return ("You are ColorSyncer, a palette synthesizer. Output exactly 8 CSS color tokens separated by single spaces; each token must be either a W3C CSS color name or a hex color in the form #RRGGBB. Do not include any extra text, punctuation, numbering, or explanations. Avoid near-duplicates, cover diverse hues across the wheel, include at least one dark anchor and one light accent, avoid extremely low-contrast combinations, and bias toward harmonious yet distinctive sets suitable for identity beacons. Prefer web-safe names if names are chosen; otherwise use hex. Hard constraints: 8 tokens, space-delimited, no commas, no line breaks, no quotes, no commentary. Round="+rnd+" Node="+node+" Topic="+topic+" Palette:")
-    def generate(self, seed_text:str, rnd:str, node:str, topic:str)->List[Tuple[int,int,int]]:
-        if self.ok:
-            res=self.llm(self.prompt(rnd,node,topic), max_tokens=64, temperature=0.7, top_p=0.9, seed=det_seed(seed_text,rnd,node,topic)) or {}
-            out=(res.get("choices") or [{}])[0].get("text","").strip()
-            return parse_colors(out, 8)
-        random.seed(det_seed(seed_text,rnd,node,topic))
-        seq=[]
-        for _ in range(8):
-            r,g,b=colorsys.hsv_to_rgb(random.random(), 0.7, 0.9)
-            seq.append((int(r*255),int(g*255),int(b*255)))
-        return seq
-
-class Allowlist:
-    def __init__(self):
-        self._ok=set(); self._lock=asyncio.Lock()
-    async def allow(self, peer_addr:str, until:int):
-        async with self._lock:
-            self._ok.add((peer_addr, until))
-    async def check(self, peer_addr:str)->bool:
-        now=int(time.time())
-        async with self._lock:
-            new=set(); ok=False
-            for addr,exp in self._ok:
-                if exp>=now:
-                    new.add((addr,exp))
-                    if addr==peer_addr: ok=True
-            self._ok=new
-            return ok
-
-class RateLimiter:
-    def __init__(self, rate:int, per:float):
-        self.rate=rate; self.per=per; self.allowance=rate; self.last=time.monotonic(); self.lock=asyncio.Lock()
-    async def try_acquire(self, n:int=1)->bool:
-        async with self.lock:
-            now=time.monotonic()
-            self.allowance+= (now-self.last)*(self.rate/self.per)
-            if self.allowance>self.rate: self.allowance=self.rate
-            self.last=now
-            if self.allowance<n: return False
-            self.allowance-=n
-            return True
-
 class GossipBus:
     def __init__(self, transport:Union[Libp2pWrapper,FallbackTransport], proto:str, peer_id:str, fanout:int=6, ttl:float=15.0):
         self.transport=transport; self.proto=proto; self.peer_id=peer_id; self.fanout=fanout; self.ttl=ttl; self.seen:Dict[str,float]={}; self.rate=RateLimiter(32,1.0); self.fallback_peers=set()
         if isinstance(transport, Libp2pWrapper): transport.set_handler(proto, self._lp2p_handler)
         else: transport.register(proto, self._fb_handler)
     def register_peer(self, addr:str):
-        if addr and ":" in addr and not addr.startswith("/"): self.fallback_peers.add(addr)
+        a=normalize_fb(addr)
+        if a and ":" in a and not a.startswith("/"): self.fallback_peers.add(a)
     def _msg_id(self, msg:Dict[str,Any])->str:
         b={k:v for k,v in msg.items() if k!='digest'}
         return h32(canonical(b))+(msg.get("digest","")[:8] if isinstance(msg.get("digest"),str) else "")
+    def _gc_seen(self):
+        cutoff=time.time() - self.ttl
+        for k,t in list(self.seen.items()):
+            if t < cutoff:
+                self.seen.pop(k, None)
     async def _lp2p_handler(self, host, stream):
         try:
+            self._gc_seen()
             hdr=await stream.read(4)
             if not hdr: return
             l=struct.unpack("!I", hdr)[0]
@@ -538,6 +673,7 @@ class GossipBus:
             except Exception: pass
     async def _fb_handler(self, send, recv, mux):
         try:
+            self._gc_seen()
             data=await recv()
             obj=canonical_load(data)
             if not isinstance(obj,dict): return
@@ -548,9 +684,9 @@ class GossipBus:
         except Exception:
             pass
     async def forward(self, src_addr:str, msg:Dict[str,Any]):
+        self._gc_seen()
         if not await self.rate.try_acquire(): return
         try:
-            peers=[]
             if isinstance(self.transport, Libp2pWrapper) and getattr(self.transport,"host",None):
                 peers=[p for p in self.transport.host.get_peerstore().peers() if str(p)!=src_addr]
                 random.shuffle(peers); peers=peers[:self.fanout]
@@ -564,7 +700,7 @@ class GossipBus:
                     except Exception:
                         continue
             else:
-                peers=[a for a in list(self.fallback_peers) if a!=src_addr]
+                peers=[a for a in list(self.fallback_peers) if a!=normalize_fb(src_addr)]
                 random.shuffle(peers); peers=peers[:self.fanout]
                 payload=canonical(msg)
                 for addr in peers:
@@ -584,7 +720,7 @@ class GossipBus:
             pass
 
 class ExchangeServer:
-    def __init__(self, store:BlockStore, providers:ProviderIndex, dht_addr:str, transport:Union[Libp2pWrapper,FallbackTransport], allow:Allowlist):
+    def __init__(self, store:BlockStore, providers:ProviderIndex, dht_addr:str, transport:Union[Libp2pWrapper,FallbackTransport], allow:'Allowlist'):
         self.store=store; self.providers=providers; self.transport=transport; self.addr=dht_addr; self.allow=allow
         if isinstance(transport, Libp2pWrapper): transport.set_handler(EX_PROTO, self._lp2p_handler)
         else: transport.register(EX_PROTO, self._fb_handler)
@@ -610,7 +746,13 @@ class ExchangeServer:
                     cid=rest.decode().strip()
                     try:
                         raw=await self.store.get(cid)
-                        await wmsg(b"BLOCK "+cid.encode()+b" "+raw)
+                        # decode CBOR and send raw file bytes over the wire
+                        try:
+                            obj=dagcbor_decode(raw)
+                            data=obj.get("bytes", raw)
+                        except Exception:
+                            data=raw
+                        await wmsg(b"BLOCK "+cid.encode()+b" "+data)
                     except FileNotFoundError:
                         provs=await self.providers.find(cid)
                         await wmsg(b"MISS "+cid.encode()+b" "+json.dumps(provs).encode())
@@ -640,7 +782,12 @@ class ExchangeServer:
                     cid=rest.decode().strip()
                     try:
                         raw=await self.store.get(cid)
-                        await send(b"BLOCK "+cid.encode()+b" "+raw)
+                        try:
+                            obj=dagcbor_decode(raw)
+                            data=obj.get("bytes", raw)
+                        except Exception:
+                            data=raw
+                        await send(b"BLOCK "+cid.encode()+b" "+data)
                     except FileNotFoundError:
                         provs=await self.providers.find(cid)
                         await send(b"MISS "+cid.encode()+b" "+json.dumps(provs).encode())
@@ -672,7 +819,8 @@ class ExchangeClient:
                     try: await st.close()
                     except Exception: pass
             else:
-                conn=await self.t.dial(peer_addr, EX_PROTO)
+                addr=normalize_fb(peer_addr)
+                conn=await self.t.dial(addr, EX_PROTO)
                 await conn.send(b"ADDR "+self.my_addr.encode())
                 if await conn.recv()!=b"OK":
                     await conn.close(); return None
@@ -687,6 +835,43 @@ class ExchangeClient:
             return None
         return None
 
+class Allowlist:
+    def __init__(self):
+        self._ok=set(); self._lock=asyncio.Lock()
+    async def allow(self, peer_addr:str, until:int):
+        a=peer_addr
+        b=normalize_fb(peer_addr)
+        async with self._lock:
+            self._ok.add((a, until))
+            if b!=a: self._ok.add((b, until))
+    async def check(self, peer_addr:str)->bool:
+        now=int(time.time())
+        a=peer_addr; b=normalize_fb(peer_addr)
+        async with self._lock:
+            new=set(); ok=False
+            for addr,exp in self._ok:
+                if exp>=now:
+                    new.add((addr,exp))
+                    if addr==a or addr==b: ok=True
+            self._ok=new
+            return ok
+
+class RateLimiter:
+    def __init__(self, rate:int, per:float):
+        self.rate=rate; self.per=per; self.allowance=rate; self.last=time.monotonic(); self.lock=asyncio.Lock()
+    async def try_acquire(self, n:int=1)->bool:
+        async with self.lock:
+            now=time.monotonic()
+            self.allowance+= (now-self.last)*(self.rate/self.per)
+            if self.allowance>self.rate: self.allowance=self.rate
+            self.last=now
+            if self.allowance<n: return False
+            self.allowance-=n
+            return True
+
+class LLMColors(HypertimeLLM):
+    pass
+
 class MiniIPFSNode:
     def __init__(self, api_host:str, api_port:int, dht_host:str, dht_port:int, listen:str, bootstrap:Optional[str], allow:Allowlist):
         self.api=(api_host, api_port); self.dht=(dht_host, dht_port); self.listen=listen; self.bootstrap=bootstrap
@@ -694,13 +879,11 @@ class MiniIPFSNode:
         self.meta=KVStore(os.path.join(tempfile.gettempdir(),"miniipfs_meta"))
         self.kad=KadServer()
         self.lp2p_ok=False
-        self.transport:Union[Libp2pWrapper,FallbackTransport]
-        self._choose_transport()
-        self.providers=ProviderIndex(self.kad)
-        dht_addr=self.listen if self.lp2p_ok else f"{self.dht[0]}:{self.dht[1]+2000}"
-        self.exchange=ExchangeServer(self.store, self.providers, dht_addr, self.transport, allow)
-        my_addr=self.listen if self.lp2p_ok else f"{self.dht[0]}:{self.dht[1]+2001}"
-        self.client=ExchangeClient(self.transport, my_addr)
+        self.transport:Optional[Union[Libp2pWrapper,FallbackTransport]]=None
+        self.providers:Optional[ProviderIndex]=None
+        self.exchange:Optional[ExchangeServer]=None
+        self.client:Optional[ExchangeClient]=None
+        self.allow=allow
         self.app=aiohttp.web.Application()
         self.app.add_routes([
             aiohttp.web.post("/api/v0/add", self.http_add),
@@ -712,21 +895,25 @@ class MiniIPFSNode:
             aiohttp.web.get("/healthz", self.http_health),
         ])
         self._runner=None; self._site=None
-    def _choose_transport(self):
-        if os.getenv("USE_LIBP2P","1")!="0":
-            try:
-                self.transport=Libp2pWrapper(self.listen); self.lp2p_ok=True; return
-            except Exception:
-                self.lp2p_ok=False
-        host,port=self.dht; self.transport=FallbackTransport(f"{host}:{port+2001}"); self.lp2p_ok=False
     async def start(self):
         await self.kad.listen(self.dht[1], interface=self.dht[0])
         if self.bootstrap:
             bhost,bport=self.bootstrap.split(":"); await self.kad.bootstrap([(bhost,int(bport))])
+        # choose and start transport; then construct services bound to that transport
         try:
+            self.transport=Libp2pWrapper(self.listen)
             await self.transport.start()
-        except Lp2pUnavailable:
-            host,port=self.dht; self.transport=FallbackTransport(f"{host}:{port+2001}"); await self.transport.start()
+            self.lp2p_ok=True
+        except Exception:
+            self.lp2p_ok=False
+            host,port=self.dht
+            self.transport=FallbackTransport(f"{host}:{port+2001}")
+            await self.transport.start()
+        self.providers=ProviderIndex(self.kad)
+        dht_addr=self.listen if self.lp2p_ok else f"{self.dht[0]}:{self.dht[1]+2000}"
+        self.exchange=ExchangeServer(self.store, self.providers, dht_addr, self.transport, self.allow)
+        my_addr=self.listen if self.lp2p_ok else f"/ip4/{self.dht[0]}/tcp/{self.dht[1]+2001}"
+        self.client=ExchangeClient(self.transport, my_addr)
         self._runner=aiohttp.web.AppRunner(self.app); await self._runner.setup()
         self._site=aiohttp.web.TCPSite(self._runner, self.api[0], self.api[1]); await self._site.start()
         await self.meta.set("self:id".encode(), str(uuid.uuid4()).encode())
@@ -734,9 +921,11 @@ class MiniIPFSNode:
     async def stop(self):
         try: await self.kad.stop()
         except Exception: pass
-        try: await self.transport.stop()
+        try:
+            if self.transport: await self.transport.stop()
         except Exception: pass
-        try: await self._runner.cleanup()
+        try:
+            if self._runner: await self._runner.cleanup()
         except Exception: pass
     async def http_health(self, req):
         return aiohttp.web.json_response({"ok":True,"cpu":psutil.cpu_percent(),"rss":psutil.Process().memory_info().rss,"libp2p":self.lp2p_ok})
@@ -973,7 +1162,8 @@ class WaggleService:
                     try: await st.close()
                     except Exception: pass
             else:
-                conn=await self.transport.dial(peer_addr, WAG_PROTO)
+                addr=normalize_fb(peer_addr)
+                conn=await self.transport.dial(addr, WAG_PROTO)
                 await conn.send(canonical(hello))
                 rsp=await conn.recv()
                 obj=canonical_load(rsp)
